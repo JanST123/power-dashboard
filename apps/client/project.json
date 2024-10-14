@@ -88,7 +88,7 @@
         "{workspaceRoot}/coverage/{projectRoot}"
       ],
       "options": {
-        "jestConfig": "client/jest.config.ts"
+        "jestConfig": "apps/client/jest.config.ts"
       }
     },
     "serve-static": {
