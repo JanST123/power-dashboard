@@ -44,3 +44,4 @@ Thumbs.db
 .angular
 
 libs/shared/src/lib/config.ts
+apps/server/data/*.sqlite

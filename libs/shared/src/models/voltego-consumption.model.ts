@@ -9,7 +9,7 @@ export interface VoltegoConsumptionValue {
 }
 
 export interface VoltegoConsumptionDataset {
-  masterSerialNumber: string;
+  meterSerialNumber: string;
   type: string;
   values: VoltegoConsumptionValue[];
   seriesKey: string;
