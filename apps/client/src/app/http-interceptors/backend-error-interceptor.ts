@@ -14,7 +14,8 @@ export class BackendErrorInterceptor implements HttpInterceptor {
           this.#messageService.add({
             severity: 'error',
             summary: 'Backend Error - ' + event.status,
-            detail: event.error.message || 'Unknown error'
+            detail: event.error.message || 'Unknown error',
+            sticky: true
           });
         }
 
