@@ -109,7 +109,13 @@ export class ConsumptionService {
 
     await this.saveToDb(consumptionResult, fromDate, toDate);
 
-    return consumptionResult;
+    return consumptionResult.map(dataset => ({
+      ...dataset,
+      values: dataset.values.map(value => ({
+        ...value,
+        value: value.value / 1000
+      }))
+    }));
   }
 
   /**

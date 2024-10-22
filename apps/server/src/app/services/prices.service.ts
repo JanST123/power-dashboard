@@ -45,16 +45,24 @@ export class PricesService {
     });
 
     if (priceCache && priceCache.prices) {
-      return priceCache.prices as VoltegoPrice[];
+      return this.mapPrices(priceCache.prices);
     }
 
     if (dateKey === new Date().toDateString()) {
     // if not cached and the requested date is today, fetch from AP
       const freshPrices = await this.fetch();
       await this.saveToDb(freshPrices, dateKey);
+      return this.mapPrices(freshPrices);
     }
 
     return [] as VoltegoPrice[];
+  }
+
+  private mapPrices(prices: VoltegoPrice[]): VoltegoPrice[] {
+    return prices.map(price => ({
+      ...price,
+      priceAmount: String(parseFloat(price.priceAmount) / 100)
+    }))
   }
 
   /**

@@ -1,6 +1,6 @@
 import { HttpClient } from '@angular/common/http';
 import { inject, Injectable } from '@angular/core';
-import { filter } from 'rxjs';
+import { filter, map } from 'rxjs';
 import { config, VoltegoPrice, VoltegoConsumptionDataset } from '@power-dashboard/shared';
 
 @Injectable({
@@ -19,6 +19,7 @@ export class VoltegoService {
   getConsumption() {
     return this.#http.get<VoltegoConsumptionDataset[]>(config.apiUrl + '/consumption').pipe(
       filter(response => !!response.length),
+      map(response => response.find(dataset => dataset.seriesType === 'CONSUMPTION'))
     );
   }
 }
