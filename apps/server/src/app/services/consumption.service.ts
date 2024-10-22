@@ -1,10 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { HttpException, HttpStatus, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { HttpService } from '@nestjs/axios';
-import { VoltegoConsumptionDataset, VoltegoConsumptionResult, config } from '@power-dashboard/shared';
-import { map, switchMap } from 'rxjs/operators';
-import { forkJoin, from } from 'rxjs';
+import { VoltegoConsumptionDataset, VoltegoConsumptionResult, VoltegoContainerResult, config } from '@power-dashboard/shared';
+import { map, tap } from 'rxjs/operators';
+import { firstValueFrom } from 'rxjs';
 import { Consumption } from '../entities/consumption.entity';
 import { ConsumptionDataset } from '../entities/consumption-dataset.entity';
 import { ConsumptionValue } from '../entities/consumption-value.entity';
@@ -20,12 +20,32 @@ export class ConsumptionService {
   ) { }
 
   /**
+   * returns information about the "container" e.g. the first- and last measurements etc
+   */
+  getContainerInformation() {
+    return firstValueFrom(
+      this.httpService.get<VoltegoContainerResult>('https://msb.voltego.de/json/WidgetJson.getContainer', {
+        params: {
+          containerId: config.voltegoGraphToken,
+          tokenId: config.voltegoGraphToken,
+        }
+      }).pipe(
+        map(response => response.data?.result)
+      )
+    );
+  }
+
+  /**
    * returns observable resolving with consumption data, also stores all the data in the database (but does not read from database)
    */
-  getAll(fromDate?: Date, toDate?: Date) {
+  async getAll(fromDate?: Date, toDate?: Date) {
+
+    const containerInformation = await this.getContainerInformation();
+
+    console.log({ containerInformation })
 
     if (!fromDate) {
-      fromDate = new Date();
+      fromDate = new Date(containerInformation.lastMeasurementTime);
       fromDate.setHours(0);
       fromDate.setMinutes(0);
       fromDate.setSeconds(0);
@@ -33,29 +53,33 @@ export class ConsumptionService {
     }
 
     if (!toDate) {
-      toDate = new Date();
+      toDate = new Date(containerInformation.lastMeasurementTime);
       toDate.setHours(23);
       toDate.setMinutes(59);
       toDate.setSeconds(59);
       toDate.setMilliseconds(9999);
     }
 
+    console.log({ fromDate, toDate })
 
-    return this.httpService.get<VoltegoConsumptionResult>('https://msb.voltego.de/json/WidgetJson.getPower', {
-      params: {
-        tokenId: config.voltegoGraphToken,
-        from: String(fromDate.getTime()),
-        to: String(toDate.getTime()),
-        interval: '900000', // the only working value = 15 min
-        _: String(Date.now())
-      }
-    }).pipe(
-      // we resolve the relative values (time, value) to absolute values to have unique db keys etc.
-      map(response => ({
-        ...response,
-        data: {
-          ...response.data,
-          result: response.data.result.map(dataset => {
+    const consumptionResult = await firstValueFrom(
+      this.httpService.get<VoltegoConsumptionResult & { status?: string; reason?: string }>('https://msb.voltego.de/json/WidgetJson.getPower', {
+        params: {
+          tokenId: config.voltegoGraphToken,
+          from: String(fromDate.getTime()),
+          to: String(toDate.getTime()),
+          interval: '900000', // the only working value = 15 min
+          _: String(Date.now())
+        }
+      }).pipe(
+        tap(response => {
+          if (response.data?.status === 'error') {
+            throw new HttpException('Consumption API Error: ' + (response.data.reason || 'unknown error'), HttpStatus.INTERNAL_SERVER_ERROR)
+          }
+        }),
+        map(response =>
+          response.data.result.map(dataset => {
+        // resolve relative time/value to absolute values!
             let lastTime: number | null = null;
             let lastValue: number | null = null;
             return {
@@ -79,98 +103,81 @@ export class ConsumptionService {
               })
             }
           })
-        }
-      })),
-      switchMap(response => this.saveToDb(response.data.result, fromDate, toDate).pipe(
-        map(() => response.data.result) // map back to the original fetch result, we only care that DB save operation is done, not about the result
-      ))
+        )
+      )
     );
+
+    await this.saveToDb(consumptionResult, fromDate, toDate);
+
+    return consumptionResult;
   }
 
   /**
    * save consumption to the DB
    */
-  private saveToDb(datasets: VoltegoConsumptionDataset[], fromDate: Date, toDate: Date) {
-    return from(
-      this.consumptionRepository.findOne({
-        where: {
-          from: fromDate.getTime(),
-          to: toDate.getTime(),
-        }
-      })
-    ).pipe(
-      switchMap(consumptionEntity => {
-        if (!consumptionEntity) {
-          consumptionEntity = new Consumption();
-          consumptionEntity.from = fromDate.getTime();
-          consumptionEntity.to = toDate.getTime();
-        }
+  private async saveToDb(datasets: VoltegoConsumptionDataset[], fromDate: Date, toDate: Date) {
+    let consumptionEntity = await this.consumptionRepository.findOne({
+      where: {
+        from: fromDate.getTime(),
+        to: toDate.getTime(),
+      }
+    });
 
-        consumptionEntity.lastUpdate = new Date();
+    if (!consumptionEntity) {
+      // if we don't have consumption entity yet, create one
+      consumptionEntity = new Consumption();
+      consumptionEntity.from = fromDate.getTime();
+      consumptionEntity.to = toDate.getTime();
+    }
 
-        return from(this.dataSource.manager.save(consumptionEntity));
-      }),
-      switchMap(consumptionEntity => {
-        // delete existing datasets and values (cause due to a bug in TypeORM the save() method does not correctly upsert )
-        return from(this.dataSource.manager.findBy(ConsumptionDataset, {
-          consumption: consumptionEntity
-        })).pipe(
-          switchMap(datasets => {
-            const obs = datasets.map(dataset => {
-              return forkJoin([
-                // delete values
-                this.dataSource.manager.delete(ConsumptionValue, { consumptionDataset: dataset }),
-                // delete datasets itself
-                this.dataSource.manager.delete(ConsumptionDataset, { id: dataset.id })
-              ]);
-            });
-            return forkJoin(obs);
-          }),
-          map(() => consumptionEntity) // map back to the entity
-        )
-      }),
-      switchMap(consumptionEntity => {
-        const obs = datasets.map(dataset => {
-          const datasetEntity = new ConsumptionDataset();
-          datasetEntity.consumption = consumptionEntity;
-          datasetEntity.color = dataset.color;
-          datasetEntity.meterSerialNumber = dataset.meterSerialNumber;
-          datasetEntity.type = dataset.type;
-          datasetEntity.seriesKey = dataset.seriesKey;
-          datasetEntity.seriesType = dataset.seriesType;
-          datasetEntity.fillArea = dataset.fillArea;
-          datasetEntity.producersCost = dataset.producerCost;
-          datasetEntity.producersCostPerKWh = dataset.producerCostPerKwh;
-          datasetEntity.costKey = dataset.costKey;
-          datasetEntity.cost = dataset.cost;
-          datasetEntity.total = dataset.total;
-          datasetEntity.sortIndex = dataset.sortIndex;
-          datasetEntity.values = [];
+    // always update last_update
+    consumptionEntity.lastUpdate = new Date();
+    await this.dataSource.manager.save(consumptionEntity);
 
-          return from(this.dataSource.manager.save(datasetEntity)).pipe(
-            switchMap((datasetEntity2) => {
-              const innerobs = dataset.values.map(value => {
-                const valueEntity = new ConsumptionValue();
-                valueEntity.consumptionDataset = datasetEntity2;
-                valueEntity.cost = value.cost;
-                valueEntity.isComputedValue = value.isComputedValue;
-                valueEntity.reactiveReading = value.reactiveReading;
-                valueEntity.reading = value.reading;
-                valueEntity.selfConsumptionReward = value.selfConsumptionReward;
-                valueEntity.time = value.time;
-                valueEntity.value = value.value;
+    // due to a bug in sqlite implementation of typeorm we first delete all consumptionDatasets and consumptionValues for that entity from the database
+    const consumptionDatasets = await this.dataSource.manager.findBy(ConsumptionDataset, {
+      consumption: consumptionEntity
+    });
 
-                return from(this.dataSource.manager.save(valueEntity));
-              })
+    for (const consumptionDataset of consumptionDatasets) {
+      await this.dataSource.manager.delete(ConsumptionValue, { consumptionDataset: consumptionDataset });
+      await this.dataSource.manager.delete(ConsumptionDataset, { id: consumptionDataset.id });
+    }
 
-              return forkJoin(innerobs);
-            })
-          )
-        });
+    // now write the data to the database
+    for (const dataset of datasets) {
+      const datasetEntity = new ConsumptionDataset();
+      datasetEntity.consumption = consumptionEntity;
+      datasetEntity.color = dataset.color;
+      datasetEntity.meterSerialNumber = dataset.meterSerialNumber;
+      datasetEntity.type = dataset.type;
+      datasetEntity.seriesKey = dataset.seriesKey;
+      datasetEntity.seriesType = dataset.seriesType;
+      datasetEntity.fillArea = dataset.fillArea;
+      datasetEntity.producersCost = dataset.producerCost;
+      datasetEntity.producersCostPerKWh = dataset.producerCostPerKwh;
+      datasetEntity.costKey = dataset.costKey;
+      datasetEntity.cost = dataset.cost;
+      datasetEntity.total = dataset.total;
+      datasetEntity.sortIndex = dataset.sortIndex;
 
-        return forkJoin(obs);
-      })
-    );
+      await this.dataSource.manager.save(datasetEntity);
+
+      // save the values
+      for (const value of (dataset.values)) {
+        const valueEntity = new ConsumptionValue();
+        valueEntity.consumptionDataset = datasetEntity;
+        valueEntity.cost = value.cost;
+        valueEntity.isComputedValue = value.isComputedValue;
+        valueEntity.reactiveReading = value.reactiveReading;
+        valueEntity.reading = value.reading;
+        valueEntity.selfConsumptionReward = value.selfConsumptionReward;
+        valueEntity.time = value.time;
+        valueEntity.value = value.value;
+
+        await this.dataSource.manager.save(valueEntity);
+      }
+    }
   }
 
 
